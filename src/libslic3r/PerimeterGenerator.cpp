@@ -1459,6 +1459,8 @@ void PerimeterGenerator::process_classic()
     Surfaces all_surfaces = this->slices->surfaces;
 
     process_no_bridge(all_surfaces, perimeter_spacing, ext_perimeter_width);
+    // ORCA: layer below, used to keep inner walls from being generated over air (see onion loop below).
+    const Polygons floating_check_lower = this->lower_slices != nullptr ? to_polygons(*this->lower_slices) : Polygons();
     // BBS: don't simplify too much which influence arc fitting when export gcode if arc_fitting is enabled
     double surface_simplify_resolution = (print_config->enable_arc_fitting && !this->has_fuzzy_skin) ? 0.2 * m_scaled_resolution : m_scaled_resolution;
     //BBS: reorder the surface to reduce the travel time
@@ -1595,16 +1597,22 @@ void PerimeterGenerator::process_classic()
                     // ORCA: an inner wall island that sits (almost) entirely over air would only be printed
                     // as a floating overhang loop and shrink the bridge under it. Stop the onion there and
                     // give that area, including the band this wall would have taken, to infill so it bridges.
-                    if (this->lower_slices != nullptr && !m_spiral_vase && !m_lower_slices_polygons.empty()) {
+                    if (!floating_check_lower.empty() && !m_spiral_vase) {
+                        ExPolygons floating_now;
                         for (size_t k = 0; k < offsets.size();) {
                             const ExPolygon &island    = offsets[k];
-                            const double     supported = area(intersection(to_polygons(island), m_lower_slices_polygons));
+                            const Polygons   lower     = ClipperUtils::clip_clipper_polygons_with_subject_bbox(floating_check_lower, get_extents(island));
+                            const double     supported = lower.empty() ? 0. : area(intersection(to_polygons(island), lower));
                             if (supported < FLOATING_WALL_SUPPORT_RATIO * island.area()) {
-                                append(floating_fill, intersection_ex(offset_ex(island, float(distance)), last));
+                                append(floating_now, intersection_ex(offset_ex(island, float(distance)), last));
                                 offsets.erase(offsets.begin() + k);
                             } else
                                 ++k;
                         }
+                        // keep clear of the walls of the islands that stay
+                        if (!floating_now.empty() && !offsets.empty())
+                            floating_now = diff_ex(floating_now, offset_ex(offsets, float(distance) / 2.f));
+                        append(floating_fill, std::move(floating_now));
                     }
                 }
                 if (offsets.empty() && offsets_with_smaller_width.empty()) {
