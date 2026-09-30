@@ -25,6 +25,8 @@ static const double narrow_loop_length_threshold = 10;
 //ext_perimeter_width + ext_perimeter_spacing  * (1 - SMALLER_EXT_INSET_OVERLAP_TOLERANCE),
 //we think it's small detail area and will generate smaller line width for it
 static constexpr double SMALLER_EXT_INSET_OVERLAP_TOLERANCE = 0.22;
+// ORCA: an inner wall island with less than this fraction of its area over the lower layer is left to infill.
+static constexpr double FLOATING_WALL_SUPPORT_RATIO = 0.1;
 
 namespace Slic3r {
     
@@ -1484,6 +1486,8 @@ void PerimeterGenerator::process_classic()
 
         ExPolygons last        = union_ex(surface.expolygon.simplify_p(surface_simplify_resolution));
         ExPolygons gaps;
+        // ORCA: inner-wall islands that would be printed over air; handed to infill (bridge) instead.
+        ExPolygons floating_fill;
         ExPolygons top_fills;
         ExPolygons fill_clip;
         // ORCA: only_one_wall_top, all empty unless this island has a top surface on this layer. See the
@@ -1587,6 +1591,21 @@ void PerimeterGenerator::process_classic()
                         append(gaps, diff_ex(
                             offset(last,    - float(0.5 * distance)),
                             offset(offsets,   float(0.5 * distance + 10))));  // safety offset
+
+                    // ORCA: an inner wall island that sits (almost) entirely over air would only be printed
+                    // as a floating overhang loop and shrink the bridge under it. Stop the onion there and
+                    // give that area, including the band this wall would have taken, to infill so it bridges.
+                    if (this->lower_slices != nullptr && !m_spiral_vase && !m_lower_slices_polygons.empty()) {
+                        for (size_t k = 0; k < offsets.size();) {
+                            const ExPolygon &island    = offsets[k];
+                            const double     supported = area(intersection(to_polygons(island), m_lower_slices_polygons));
+                            if (supported < FLOATING_WALL_SUPPORT_RATIO * island.area()) {
+                                append(floating_fill, intersection_ex(offset_ex(island, float(distance)), last));
+                                offsets.erase(offsets.begin() + k);
+                            } else
+                                ++k;
+                        }
+                    }
                 }
                 if (offsets.empty() && offsets_with_smaller_width.empty()) {
                     // Store the number of loops actually generated.
@@ -1965,6 +1984,8 @@ void PerimeterGenerator::process_classic()
         // simplify infill contours according to resolution
         Polygons pp;
         for (ExPolygon &ex : last)
+            ex.simplify_p(m_scaled_resolution, &pp);
+        for (ExPolygon &ex : floating_fill)
             ex.simplify_p(m_scaled_resolution, &pp);
         ExPolygons not_filled_exp = union_ex(pp);
         // collapse too narrow infill areas
