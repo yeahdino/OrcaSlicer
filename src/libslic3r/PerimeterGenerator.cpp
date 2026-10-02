@@ -25,8 +25,6 @@ static const double narrow_loop_length_threshold = 10;
 //ext_perimeter_width + ext_perimeter_spacing  * (1 - SMALLER_EXT_INSET_OVERLAP_TOLERANCE),
 //we think it's small detail area and will generate smaller line width for it
 static constexpr double SMALLER_EXT_INSET_OVERLAP_TOLERANCE = 0.22;
-// ORCA: an inner wall island with less than this fraction of its area over the lower layer is left to infill.
-static constexpr double FLOATING_WALL_SUPPORT_RATIO = 0.1;
 
 namespace Slic3r {
     
@@ -1459,8 +1457,10 @@ void PerimeterGenerator::process_classic()
     Surfaces all_surfaces = this->slices->surfaces;
 
     process_no_bridge(all_surfaces, perimeter_spacing, ext_perimeter_width);
-    // ORCA: layer below, used to keep inner walls from being generated over air (see onion loop below).
-    const Polygons floating_check_lower = this->lower_slices != nullptr ? to_polygons(*this->lower_slices) : Polygons();
+    // ORCA: layer below (with a half-wall overhang tolerance), used to keep inner walls that do not fit over the
+    // supported part of the layer from being generated over air. See the onion loop below.
+    const Polygons floating_check_lower = (this->lower_slices != nullptr && !m_spiral_vase) ?
+        offset(*this->lower_slices, float(perimeter_spacing) / 2.f) : Polygons();
     // BBS: don't simplify too much which influence arc fitting when export gcode if arc_fitting is enabled
     double surface_simplify_resolution = (print_config->enable_arc_fitting && !this->has_fuzzy_skin) ? 0.2 * m_scaled_resolution : m_scaled_resolution;
     //BBS: reorder the surface to reduce the travel time
@@ -1490,6 +1490,11 @@ void PerimeterGenerator::process_classic()
         ExPolygons gaps;
         // ORCA: inner-wall islands that would be printed over air; handed to infill (bridge) instead.
         ExPolygons floating_fill;
+        // ORCA: the same onion run over the supported part of the layer only. An inner wall island that
+        // contains none of it at the same depth is a wall that does not fit over the support.
+        ExPolygons last_supported;
+        if (!floating_check_lower.empty())
+            last_supported = intersection_ex(last, floating_check_lower);
         ExPolygons top_fills;
         ExPolygons fill_clip;
         // ORCA: only_one_wall_top, all empty unless this island has a top surface on this layer. See the
@@ -1549,6 +1554,9 @@ void PerimeterGenerator::process_classic()
                             }
                         }
                     }
+                    // ORCA: mirror the outer wall step on the supported-only onion
+                    if (!floating_check_lower.empty())
+                        last_supported = offset_ex(last_supported, -float(ext_perimeter_width / 2.));
                     if (m_spiral_vase && (offsets.size() > 1 || offsets_with_smaller_width.size() > 1)) {
                         // Remove all but the largest area polygon.
                         keep_largest_contour_only(offsets);
@@ -1594,16 +1602,20 @@ void PerimeterGenerator::process_classic()
                             offset(last,    - float(0.5 * distance)),
                             offset(offsets,   float(0.5 * distance + 10))));  // safety offset
 
-                    // ORCA: an inner wall island that sits (almost) entirely over air would only be printed
-                    // as a floating overhang loop and shrink the bridge under it. Stop the onion there and
-                    // give that area, including the band this wall would have taken, to infill so it bridges.
-                    if (!floating_check_lower.empty() && !m_spiral_vase) {
+                    // ORCA: an inner wall island that does not fit over the supported part of the layer would only be
+                    // printed as a floating loop over a bridge, shrinking the bridge and leaving it nothing to anchor to.
+                    // Stop the onion there and give that area, including the band this wall would have taken, to infill
+                    // so it is bridged.
+                    if (!floating_check_lower.empty()) {
+                        last_supported = offset2_ex(last_supported,
+                            -float(distance + min_spacing / 2. - 1.),
+                            float(min_spacing / 2. - 1.));
+                        const double min_supported_area = double(perimeter_spacing) * double(perimeter_spacing);
                         ExPolygons floating_now;
                         for (size_t k = 0; k < offsets.size();) {
-                            const ExPolygon &island    = offsets[k];
-                            const Polygons   lower     = ClipperUtils::clip_clipper_polygons_with_subject_bbox(floating_check_lower, get_extents(island));
-                            const double     supported = lower.empty() ? 0. : area(intersection(to_polygons(island), lower));
-                            if (supported < FLOATING_WALL_SUPPORT_RATIO * island.area()) {
+                            const ExPolygon &island = offsets[k];
+                            const Polygons   sup    = ClipperUtils::clip_clipper_polygons_with_subject_bbox(last_supported, get_extents(island));
+                            if (sup.empty() || area(intersection(to_polygons(island), sup)) < min_supported_area) {
                                 append(floating_now, intersection_ex(offset_ex(island, float(distance)), last));
                                 offsets.erase(offsets.begin() + k);
                             } else
