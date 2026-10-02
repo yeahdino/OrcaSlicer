@@ -1386,6 +1386,16 @@ static void defer_unsupported_loops(const PerimeterGenerator &perimeter_generato
             loop->print_after_infill = true;
 }
 
+// ORCA: the part of `region` that is not over the layer below and is wide enough to be bridged
+// (thin slivers along ordinary overhangs are left alone).
+static ExPolygons carve_unsupported(const ExPolygons &region, const Polygons &lower_grown, coord_t perimeter_spacing)
+{
+    if (region.empty() || lower_grown.empty())
+        return {};
+    const Polygons lower = ClipperUtils::clip_clipper_polygons_with_subject_bbox(lower_grown, get_extents(region).inflated(SCALED_EPSILON));
+    return opening_ex(diff_ex(region, lower), float(perimeter_spacing));
+}
+
 void PerimeterGenerator::process_classic()
 {
     group_region_by_fuzzify(*this);
@@ -1457,8 +1467,9 @@ void PerimeterGenerator::process_classic()
     Surfaces all_surfaces = this->slices->surfaces;
 
     process_no_bridge(all_surfaces, perimeter_spacing, ext_perimeter_width);
-    // ORCA: layer below (with a half-wall overhang tolerance), used to keep inner walls that do not fit over the
-    // supported part of the layer from being generated over air. See the onion loop below.
+    // ORCA: the layer below grown by half a wall (an overhang tolerance). Inner walls are kept off any area
+    // of the layer that is unsupported by it and wider than a couple of walls - a bridge - so walls that do
+    // not fit over the supported part are not printed in mid air around the bridge. See carve_unsupported().
     const Polygons floating_check_lower = (this->lower_slices != nullptr && !m_spiral_vase) ?
         offset(*this->lower_slices, float(perimeter_spacing) / 2.f) : Polygons();
     // BBS: don't simplify too much which influence arc fitting when export gcode if arc_fitting is enabled
@@ -1488,13 +1499,8 @@ void PerimeterGenerator::process_classic()
 
         ExPolygons last        = union_ex(surface.expolygon.simplify_p(surface_simplify_resolution));
         ExPolygons gaps;
-        // ORCA: inner-wall islands that would be printed over air; handed to infill (bridge) instead.
+        // ORCA: unsupported areas cut out of the wall region; they go to the infill and get bridged.
         ExPolygons floating_fill;
-        // ORCA: the same onion run over the supported part of the layer only. An inner wall island that
-        // contains none of it at the same depth is a wall that does not fit over the support.
-        ExPolygons last_supported;
-        if (!floating_check_lower.empty())
-            last_supported = intersection_ex(last, floating_check_lower);
         ExPolygons top_fills;
         ExPolygons fill_clip;
         // ORCA: only_one_wall_top, all empty unless this island has a top surface on this layer. See the
@@ -1554,9 +1560,6 @@ void PerimeterGenerator::process_classic()
                             }
                         }
                     }
-                    // ORCA: mirror the outer wall step on the supported-only onion
-                    if (!floating_check_lower.empty())
-                        last_supported = offset_ex(last_supported, -float(ext_perimeter_width / 2.));
                     if (m_spiral_vase && (offsets.size() > 1 || offsets_with_smaller_width.size() > 1)) {
                         // Remove all but the largest area polygon.
                         keep_largest_contour_only(offsets);
@@ -1572,6 +1575,16 @@ void PerimeterGenerator::process_classic()
                     //FIXME Is this offset correct if the line width of the inner perimeters differs
                     // from the line width of the infill?
                     coord_t distance = (i == 1) ? ext_perimeter_spacing2 : perimeter_spacing;
+                    // ORCA: keep the inner walls on the supported part of the layer. A bridge cut out of the region
+                    // here is walled along its supported edges instead of being ringed by loops over air, and the
+                    // area cut out (grown back to the next wall) becomes infill, which bridges it.
+                    if (!floating_check_lower.empty()) {
+                        const ExPolygons unsupported = carve_unsupported(last, floating_check_lower, perimeter_spacing);
+                        if (!unsupported.empty()) {
+                            append(floating_fill, intersection_ex(offset_ex(unsupported, float(distance)), last));
+                            last = diff_ex(last, unsupported);
+                        }
+                    }
                     //BBS
                     //offsets = this->config->thin_walls ?
                         // This path will ensure, that the perimeters do not overfill, as in
@@ -1601,31 +1614,6 @@ void PerimeterGenerator::process_classic()
                         append(gaps, diff_ex(
                             offset(last,    - float(0.5 * distance)),
                             offset(offsets,   float(0.5 * distance + 10))));  // safety offset
-
-                    // ORCA: an inner wall island that does not fit over the supported part of the layer would only be
-                    // printed as a floating loop over a bridge, shrinking the bridge and leaving it nothing to anchor to.
-                    // Stop the onion there and give that area, including the band this wall would have taken, to infill
-                    // so it is bridged.
-                    if (!floating_check_lower.empty()) {
-                        last_supported = offset2_ex(last_supported,
-                            -float(distance + min_spacing / 2. - 1.),
-                            float(min_spacing / 2. - 1.));
-                        const double min_supported_area = double(perimeter_spacing) * double(perimeter_spacing);
-                        ExPolygons floating_now;
-                        for (size_t k = 0; k < offsets.size();) {
-                            const ExPolygon &island = offsets[k];
-                            const Polygons   sup    = ClipperUtils::clip_clipper_polygons_with_subject_bbox(last_supported, get_extents(island));
-                            if (sup.empty() || area(intersection(to_polygons(island), sup)) < min_supported_area) {
-                                append(floating_now, intersection_ex(offset_ex(island, float(distance)), last));
-                                offsets.erase(offsets.begin() + k);
-                            } else
-                                ++k;
-                        }
-                        // keep clear of the walls of the islands that stay
-                        if (!floating_now.empty() && !offsets.empty())
-                            floating_now = diff_ex(floating_now, offset_ex(offsets, float(distance) / 2.f));
-                        append(floating_fill, std::move(floating_now));
-                    }
                 }
                 if (offsets.empty() && offsets_with_smaller_width.empty()) {
                     // Store the number of loops actually generated.
@@ -2513,6 +2501,11 @@ void PerimeterGenerator::process_arachne()
     Surfaces all_surfaces = this->slices->surfaces;
 
     process_no_bridge(all_surfaces, perimeter_spacing, ext_perimeter_width);
+    // ORCA: the layer below grown by half a wall (an overhang tolerance). Inner walls are kept off any area
+    // of the layer that is unsupported by it and wider than a couple of walls - a bridge - so walls that do
+    // not fit over the supported part are not printed in mid air around the bridge. See carve_unsupported().
+    const Polygons floating_check_lower = (this->lower_slices != nullptr && !m_spiral_vase) ?
+        offset(*this->lower_slices, float(perimeter_spacing) / 2.f) : Polygons();
     // BBS: don't simplify too much which influence arc fitting when export gcode if arc_fitting is enabled
     double surface_simplify_resolution = (print_config->enable_arc_fitting && !this->has_fuzzy_skin) ? 0.2 * m_scaled_resolution : m_scaled_resolution;
     // ORCA: neither one-wall option has a surface to act on without the shell behind it, see
@@ -2558,6 +2551,9 @@ void PerimeterGenerator::process_arachne()
         ExPolygons top_expolygons;
         // Calculate how many inner loops remain when TopSurfaces is selected.
         const int inner_loop_number = (only_one_wall_top && upper_slices != nullptr) ? loop_number - 1 : -1;
+
+        // ORCA: the wall count before the one-wall-top split below, for keeping walls off bridges.
+        const int total_loop_number = loop_number;
 
         // Set one perimeter when TopSurfaces is selected.
         if (only_one_wall_top && loop_number > 0)
@@ -2650,6 +2646,29 @@ void PerimeterGenerator::process_arachne()
             }
         }
         //PS
+
+        // ORCA: keep the inner walls on the supported part of the layer (see process_classic). The outer wall
+        // follows the model as usual; the inner walls are generated inside it minus any bridge, which goes
+        // to the infill. Left to the one-wall-top path when this layer has a top surface.
+        if (!floating_check_lower.empty() && total_loop_number > 0 && top_expolygons.empty()) {
+            Arachne::WallToolPaths outer_tool_paths(last_p, bead_width_0, perimeter_spacing, 1, wall_0_inset, layer_height, input_params_tmp);
+            const ExPolygons outer_inner_contour = union_ex(outer_tool_paths.getInnerContour());
+            const ExPolygons unsupported         = carve_unsupported(outer_inner_contour, floating_check_lower, perimeter_spacing);
+            if (!unsupported.empty()) {
+                std::vector<Arachne::VariableWidthLines> carved_perimeters = outer_tool_paths.getToolPaths();
+                const Polygons inner_region = to_polygons(offset_ex(diff_ex(outer_inner_contour, unsupported), wall_0_inset));
+                Arachne::WallToolPaths inner_tool_paths(inner_region, perimeter_spacing, perimeter_spacing, coord_t(total_loop_number), 0, layer_height, input_params_tmp);
+                std::vector<Arachne::VariableWidthLines> inner_perimeters = inner_tool_paths.getToolPaths();
+                // The inner walls come after the single outer wall.
+                if (!carved_perimeters.empty())
+                    for (Arachne::VariableWidthLines &inner_perimeter : inner_perimeters)
+                        for (Arachne::ExtrusionLine &el : inner_perimeter)
+                            ++el.inset_idx;
+                carved_perimeters.insert(carved_perimeters.end(), inner_perimeters.begin(), inner_perimeters.end());
+                perimeters     = std::move(carved_perimeters);
+                infill_contour = union_ex(union_ex(inner_tool_paths.getInnerContour()), unsupported);
+            }
+        }
 
         loop_number = int(perimeters.size()) - 1;
 
