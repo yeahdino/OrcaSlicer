@@ -1396,6 +1396,88 @@ static void defer_unsupported_loops(const PerimeterGenerator &perimeter_generato
             loop->print_after_infill = true;
 }
 
+// ORCA: keep inner walls off bridges.
+// When a layer bridges an opening and the solid area on one side is too narrow for all of the walls, the walls that do
+// not fit would otherwise run along the opening in mid air. Instead, the first wall that would hang over the bridge and
+// every wall after it are laid out around the solid area with the bridge cut out of their region, set back so the
+// bridge reaches BRIDGE_WALL_ANCHOR onto solid ground before meeting them. Walls that cross the opening as a span from
+// one solid edge to another are left as they are.
+
+// How far the bridge reaches onto the solid side before the walls that were moved off it, in mm.
+static constexpr double BRIDGE_WALL_ANCHOR = 1.;
+
+// The part of `region` that is not over the layer below and is wider than about three walls - a bridge. Narrower
+// unsupported bands are ordinary overhangs and are left to the overhang wall handling. Islands with nothing at all
+// under them are left alone too.
+static ExPolygons wide_unsupported_area(const ExPolygons &region, const ExPolygons &lower_slices, coord_t perimeter_spacing)
+{
+    if (region.empty() || lower_slices.empty())
+        return {};
+    const Polygons lower = ClipperUtils::clip_clipper_polygons_with_subject_bbox(lower_slices, get_extents(region).inflated(SCALED_EPSILON));
+    if (lower.empty())
+        return {};
+    return opening_ex(diff_ex(region, lower), 1.5f * float(perimeter_spacing));
+}
+
+// The solid edges along a bridge - solid ground of the layer below beside it - one entry per separate edge, grown a
+// little so points on the bridge boundary fall inside them. A wall may cross the bridge only from one of these to
+// another. Only solid ground counts and hairline slivers are dropped: where the bridge runs out to the outline of the
+// layer, rounding can leave a sliver along the outline that would otherwise join the edges on either side of it.
+static std::vector<ExPolygons> bridge_anchor_edges(const ExPolygons &region, const ExPolygons &bridge, const ExPolygons &lower_slices,
+                                                   coord_t perimeter_spacing)
+{
+    const Polygons   lower = ClipperUtils::clip_clipper_polygons_with_subject_bbox(lower_slices, get_extents(region).inflated(SCALED_EPSILON));
+    const ExPolygons edges = opening_ex(
+        diff_ex(intersection_ex(intersection_ex(offset_ex(bridge, float(perimeter_spacing)), region), lower), bridge),
+        float(perimeter_spacing) / 8.f);
+    std::vector<ExPolygons> out;
+    for (const ExPolygon &edge : edges)
+        out.emplace_back(offset_ex(edge, float(perimeter_spacing) / 4.f));
+    return out;
+}
+
+// True if one of these walls would hang over the bridge: some stretch of it over the bridge does not run across it from
+// one solid edge to a different one, but runs along it, comes back to the edge it started from or ends in the air.
+static bool wall_hangs_over_bridge(const Polygons &loops, const Polylines &open_walls, const ExPolygons &bridge,
+                                   const std::vector<ExPolygons> &anchors, coord_t perimeter_spacing)
+{
+    auto over_bridge = [&bridge](const Point &p) {
+        for (const ExPolygon &e : bridge)
+            if (e.contains(p))
+                return true;
+        return false;
+    };
+    auto anchor_of = [&anchors](const Point &p) {
+        for (size_t i = 0; i < anchors.size(); ++ i)
+            for (const ExPolygon &e : anchors[i])
+                if (e.contains(p))
+                    return int(i);
+        return -1;
+    };
+    Polylines paths = open_walls;
+    for (const Polygon &loop : loops) {
+        // Open the loop off the bridge, so it is only cut where it enters and leaves the bridge.
+        size_t start = loop.points.size();
+        for (size_t i = 0; i < loop.points.size(); ++ i)
+            if (! over_bridge(loop.points[i])) {
+                start = i;
+                break;
+            }
+        if (start == loop.points.size())
+            return true; // the whole loop is over the bridge
+        paths.emplace_back(loop.split_at_index(int(start)));
+    }
+    for (const Polyline &piece : intersection_pl(paths, bridge)) {
+        if (piece.length() < double(perimeter_spacing))
+            continue;
+        const int a = anchor_of(piece.first_point());
+        const int b = anchor_of(piece.last_point());
+        if (a < 0 || b < 0 || a == b)
+            return true;
+    }
+    return false;
+}
+
 void PerimeterGenerator::process_classic()
 {
     group_region_by_fuzzify(*this);
@@ -1494,6 +1576,14 @@ void PerimeterGenerator::process_classic()
 
         ExPolygons last        = union_ex(surface.expolygon.simplify_p(surface_simplify_resolution));
         ExPolygons gaps;
+        // ORCA: keep inner walls off bridges, see wall_hangs_over_bridge(). The bridge cut out of the wall region
+        // goes to the infill.
+        ExPolygons floating_fill;
+        const ExPolygons bridge_area = (this->lower_slices != nullptr && !m_spiral_vase) ?
+            wide_unsupported_area(last, *this->lower_slices, perimeter_spacing) : ExPolygons();
+        const std::vector<ExPolygons> bridge_anchors = bridge_area.empty() ? std::vector<ExPolygons>() :
+            bridge_anchor_edges(last, bridge_area, *this->lower_slices, perimeter_spacing);
+        bool walls_moved_off_bridge = false;
         ExPolygons top_fills;
         ExPolygons fill_clip;
         // ORCA: only_one_wall_top, all empty unless this island has a top surface on this layer. See the
@@ -1589,6 +1679,19 @@ void PerimeterGenerator::process_classic()
                     offsets = offset2_ex(last,
                         -float(distance + min_spacing / 2. - 1.),
                         float(min_spacing / 2. - 1.));
+                    // ORCA: if this wall would hang over a bridge, cut the bridge (plus its anchor onto the solid side)
+                    // out of the region, so this wall and the ones after it go around the solid area instead. The cut
+                    // area, grown back to this wall, becomes infill and is bridged.
+                    if (!bridge_area.empty() && !walls_moved_off_bridge &&
+                        wall_hangs_over_bridge(to_polygons(offsets), Polylines(), bridge_area, bridge_anchors, perimeter_spacing)) {
+                        const ExPolygons cut = offset_ex(bridge_area, float(scale_(BRIDGE_WALL_ANCHOR)));
+                        append(floating_fill, intersection_ex(offset_ex(cut, float(distance)), last));
+                        last    = diff_ex(last, cut);
+                        offsets = offset2_ex(last,
+                            -float(distance + min_spacing / 2. - 1.),
+                            float(min_spacing / 2. - 1.));
+                        walls_moved_off_bridge = true;
+                    }
                     // look for gaps
                     if (has_gap_fill)
                         // not using safety offset here would "detect" very narrow gaps
@@ -1975,6 +2078,8 @@ void PerimeterGenerator::process_classic()
         // simplify infill contours according to resolution
         Polygons pp;
         for (ExPolygon &ex : last)
+            ex.simplify_p(m_scaled_resolution, &pp);
+        for (ExPolygon &ex : floating_fill)
             ex.simplify_p(m_scaled_resolution, &pp);
         ExPolygons not_filled_exp = union_ex(pp);
         // collapse too narrow infill areas
@@ -2528,6 +2633,9 @@ void PerimeterGenerator::process_arachne()
         // Calculate how many inner loops remain when TopSurfaces is selected.
         const int inner_loop_number = (only_one_wall_top && upper_slices != nullptr) ? loop_number - 1 : -1;
 
+        // ORCA: the wall count before the one-wall-top split below, for keeping inner walls off bridges.
+        const int total_loop_number = loop_number;
+
         // Set one perimeter when TopSurfaces is selected.
         if (only_one_wall_top && loop_number > 0)
             loop_number = 0;
@@ -2619,6 +2727,56 @@ void PerimeterGenerator::process_arachne()
             }
         }
         //PS
+
+        // ORCA: keep inner walls off bridges (see process_classic). Find the first wall that would hang over a bridge;
+        // the walls before it are generated as usual, it and the walls after it inside the region minus the bridge and
+        // its anchor, which go to the infill. Left to the one-wall-top path when this layer has a top surface.
+        if (this->lower_slices != nullptr && !m_spiral_vase && total_loop_number > 0 && top_expolygons.empty()) {
+            const ExPolygons bridge_area = wide_unsupported_area(last, *this->lower_slices, perimeter_spacing);
+            if (!bridge_area.empty()) {
+                const std::vector<ExPolygons> bridge_anchors = bridge_anchor_edges(last, bridge_area, *this->lower_slices, perimeter_spacing);
+                int first_hanging = -1;
+                for (const Arachne::VariableWidthLines &inset : perimeters)
+                    for (const Arachne::ExtrusionLine &line : inset) {
+                        if (line.inset_idx == 0 || line.junctions.size() < 2 || (first_hanging >= 0 && int(line.inset_idx) >= first_hanging))
+                            continue;
+                        Polygons  loops;
+                        Polylines open_walls;
+                        if (line.is_closed) {
+                            Polygon poly;
+                            for (const Arachne::ExtrusionJunction &j : line.junctions)
+                                poly.points.emplace_back(j.p);
+                            if (poly.points.size() > 1 && poly.points.front() == poly.points.back())
+                                poly.points.pop_back();
+                            loops.emplace_back(std::move(poly));
+                        } else {
+                            Polyline pl;
+                            for (const Arachne::ExtrusionJunction &j : line.junctions)
+                                pl.points.emplace_back(j.p);
+                            open_walls.emplace_back(std::move(pl));
+                        }
+                        if (wall_hangs_over_bridge(loops, open_walls, bridge_area, bridge_anchors, perimeter_spacing))
+                            first_hanging = int(line.inset_idx);
+                    }
+                if (first_hanging > 0) {
+                    Arachne::WallToolPaths outer_tool_paths(last_p, bead_width_0, perimeter_spacing, coord_t(first_hanging), wall_0_inset, layer_height, input_params_tmp);
+                    std::vector<Arachne::VariableWidthLines> moved_perimeters = outer_tool_paths.getToolPaths();
+                    const ExPolygons outer_inner_contour = union_ex(outer_tool_paths.getInnerContour());
+                    const ExPolygons cut                 = offset_ex(bridge_area, float(scale_(BRIDGE_WALL_ANCHOR)));
+                    const Polygons   inner_region        = to_polygons(diff_ex(outer_inner_contour, cut));
+                    Arachne::WallToolPaths inner_tool_paths(inner_region, perimeter_spacing, perimeter_spacing,
+                                                            coord_t(total_loop_number + 1 - first_hanging), 0, layer_height, input_params_tmp);
+                    std::vector<Arachne::VariableWidthLines> inner_perimeters = inner_tool_paths.getToolPaths();
+                    // The moved walls keep their place in the wall order.
+                    for (Arachne::VariableWidthLines &inner_perimeter : inner_perimeters)
+                        for (Arachne::ExtrusionLine &el : inner_perimeter)
+                            el.inset_idx += size_t(first_hanging);
+                    moved_perimeters.insert(moved_perimeters.end(), inner_perimeters.begin(), inner_perimeters.end());
+                    perimeters     = std::move(moved_perimeters);
+                    infill_contour = union_ex(union_ex(inner_tool_paths.getInnerContour()), intersection_ex(cut, outer_inner_contour));
+                }
+            }
+        }
 
         loop_number = int(perimeters.size()) - 1;
 
