@@ -290,7 +290,8 @@ std::vector<Bridge> get_grouped_bridges(
 void detect_bridge_directions(
     const Algorithm::WaveSeeds& bridge_anchors,
     std::vector<Bridge>& bridges,
-    const std::vector<ExpansionZone>& expansion_zones
+    const std::vector<ExpansionZone>& expansion_zones,
+    const Polygons& lower_layer_anchors
 ) {
     if (expansion_zones.empty()) {
         throw std::runtime_error("At least one expansion zone must exist!");
@@ -316,7 +317,18 @@ void detect_bridge_directions(
                 }
             }
         }
-        Lines lines{to_lines(diff_pl(to_polylines(bridge.expolygon), expand(anchor_areas, float(SCALED_EPSILON))))};
+        Polylines floating_edges = diff_pl(to_polylines(bridge.expolygon), expand(anchor_areas, float(SCALED_EPSILON)));
+        // ORCA: an edge of the bridge lying on the layer below is anchored too, also where walls rather than infill
+        // border the bridge there - as Orca's earlier bridge detection did, which anchored bridges on the layer below.
+        // Otherwise a bridge between two walls standing on solid ground looks unanchored on both sides and is run
+        // along them, the long way.
+        if (!floating_edges.empty() && !lower_layer_anchors.empty()) {
+            const Polygons lower = ClipperUtils::clip_clipper_polygons_with_subject_bbox(
+                lower_layer_anchors, get_extents(bridge.expolygon).inflated(scale_(1.)));
+            if (!lower.empty())
+                floating_edges = diff_pl(floating_edges, expand(lower, float(scale_(0.05))));
+        }
+        Lines lines{to_lines(floating_edges)};
         auto [bridging_dir, unsupported_dist] = detect_bridging_direction(lines, to_polygons(bridge.expolygon));
         bridge.angle = M_PI + std::atan2(bridging_dir.y(), bridging_dir.x());
 
@@ -426,7 +438,8 @@ ExpansionResult expand_expolygons(
 Surfaces expand_bridges_detect_orientations(
     Surfaces &surfaces,
     std::vector<ExpansionZone>& expansion_zones,
-    const float closing_radius
+    const float closing_radius,
+    const Polygons& lower_layer_anchors
 )
 {
     using namespace Slic3r::Algorithm;
@@ -449,7 +462,7 @@ Surfaces expand_bridges_detect_orientations(
     bridge_expolygons.clear();
 
     std::sort(expansion_result.anchors.begin(), expansion_result.anchors.end(), Algorithm::lower_by_src_and_boundary);
-    detect_bridge_directions(expansion_result.anchors, bridges, expansion_zones);
+    detect_bridge_directions(expansion_result.anchors, bridges, expansion_zones, lower_layer_anchors);
 
     // Merge the groups with the same group id, produce surfaces by merging source overhangs with their newly expanded anchors.
     std::sort(expansion_result.expansions.begin(), expansion_result.expansions.end(), [](auto &l, auto &r) {
@@ -576,7 +589,10 @@ void LayerRegion::process_external_surfaces(const Layer *lower_layer, const Poly
 
         bridges.surfaces = (custom_angle_deg > 0.0 && !relative_angle) ?
             expand_merge_surfaces(this->fill_surfaces.surfaces, stBottomBridge, expansion_zones, closing_radius, custom_angle_rad + align_offset_rad) :
-            expand_bridges_detect_orientations(this->fill_surfaces.surfaces, expansion_zones, closing_radius);
+            expand_bridges_detect_orientations(this->fill_surfaces.surfaces, expansion_zones, closing_radius,
+                // ORCA: what the layer below supports, for anchoring bridge edges on it (see detect_bridge_directions).
+                lower_layer_covered != nullptr ? *lower_layer_covered :
+                lower_layer != nullptr ? to_polygons(lower_layer->lslices) : Polygons());
         if (custom_angle_deg > 0.0 && relative_angle) {
             for (Surface &bridge_surface : bridges.surfaces) {
                 if (bridge_surface.bridge_angle >= 0)
@@ -1155,4 +1171,3 @@ void LayerRegion::simplify_loop(ExtrusionLoop* loop)
 }
 
 }
- 
