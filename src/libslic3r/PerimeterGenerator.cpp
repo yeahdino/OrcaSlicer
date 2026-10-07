@@ -1449,15 +1449,20 @@ static void defer_unsupported_loops(const PerimeterGenerator &perimeter_generato
 // When a layer bridges an opening and the solid area on one side is too narrow for all of the walls, the walls that do
 // not fit would otherwise run along the opening in mid air. Instead, the first wall that would hang over the bridge and
 // every wall after it are laid out around the solid area with the bridge cut out of their region, set back so the
-// bridge reaches BRIDGE_WALL_ANCHOR onto solid ground before meeting them. Walls that cross the opening as a span from
-// one solid edge to another are left as they are.
+// bridge reaches onto solid ground before meeting them. Walls that cross the opening as a span from one solid edge to
+// another are left as they are.
 
-// How far the bridge reaches onto the solid side before the walls that were moved off it, in mm.
-static constexpr double BRIDGE_WALL_ANCHOR = 1.;
+// How far the bridge reaches onto the solid side before the walls that were moved off it, scaled. The same margin as
+// bridge infill elsewhere: BRIDGE_INFILL_MARGIN, reduced for nozzles smaller than 0.4 mm.
+static float bridge_wall_anchor(double nozzle_diameter)
+{
+    return std::min(float(scale_(BRIDGE_INFILL_MARGIN)), float(scale_(nozzle_diameter * BRIDGE_INFILL_MARGIN / 0.4)));
+}
 
 // The part of `region` that is not over the layer below and is wider than about three walls - a bridge. Narrower
 // unsupported bands are ordinary overhangs and are left to the overhang wall handling. Islands with nothing at all
-// under them are left alone too.
+// under them are left alone too. This is one wall wider than process_no_bridge filters small overhangs at: at two
+// walls, every layer of a steep overhang (around 1 mm of overhang per layer) would count as a bridge.
 static ExPolygons wide_unsupported_area(const ExPolygons &region, const ExPolygons &lower_slices, coord_t perimeter_spacing)
 {
     if (region.empty() || lower_slices.empty())
@@ -1735,7 +1740,8 @@ void PerimeterGenerator::process_classic()
                     // area, grown back to this wall, becomes infill and is bridged.
                     if (!bridge_area.empty() && !walls_moved_off_bridge &&
                         wall_hangs_over_bridge(to_polygons(offsets), Polylines(), bridge_area, bridge_anchors, perimeter_spacing)) {
-                        const ExPolygons cut = offset_ex(bridge_area, float(scale_(BRIDGE_WALL_ANCHOR)));
+                        const ExPolygons cut = offset_ex(bridge_area,
+                            bridge_wall_anchor(this->print_config->nozzle_diameter.get_at(this->config->outer_wall_filament_id - 1)));
                         append(floating_fill, intersection_ex(offset_ex(cut, float(distance)), last));
                         last    = diff_ex(last, cut);
                         offsets = offset2_ex(last,
@@ -2867,7 +2873,8 @@ void PerimeterGenerator::process_arachne()
                     Arachne::WallToolPaths outer_tool_paths(last_p, bead_width_0, perimeter_spacing, coord_t(first_hanging), wall_0_inset, layer_height, input_params_tmp);
                     std::vector<Arachne::VariableWidthLines> moved_perimeters = outer_tool_paths.getToolPaths();
                     const ExPolygons outer_inner_contour = union_ex(outer_tool_paths.getInnerContour());
-                    const ExPolygons cut                 = offset_ex(bridge_area, float(scale_(BRIDGE_WALL_ANCHOR)));
+                    const ExPolygons cut                 = offset_ex(bridge_area,
+                        bridge_wall_anchor(this->print_config->nozzle_diameter.get_at(this->config->outer_wall_filament_id - 1)));
                     const Polygons   inner_region        = to_polygons(diff_ex(outer_inner_contour, cut));
                     Arachne::WallToolPaths inner_tool_paths(inner_region, perimeter_spacing, perimeter_spacing,
                                                             coord_t(total_loop_number + 1 - first_hanging), 0, layer_height, input_params_tmp);
