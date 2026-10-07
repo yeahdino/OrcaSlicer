@@ -594,14 +594,19 @@ void LayerRegion::process_external_surfaces(const Layer *lower_layer, const Poly
             align_offset_rad = std::atan2((double)m(1, 0), (double)m(0, 0));
         }
 
+        // ORCA: what the layer below supports, for anchoring bridge edges on it (see detect_bridge_directions), and
+        // the radius bottom surfaces are opened by in PrintObject::detect_surfaces_type. The layer below is only
+        // converted when there are bridges to anchor.
+        Polygons lower_layer_polygons;
+        if (lower_layer_covered == nullptr && lower_layer != nullptr && this->fill_surfaces.has(stBottomBridge))
+            lower_layer_polygons = to_polygons(lower_layer->lslices);
+        const Polygons &lower_layer_anchors   = lower_layer_covered != nullptr ? *lower_layer_covered : lower_layer_polygons;
+        const float     lower_layer_tolerance = this->flow(frExternalPerimeter).scaled_width() / 10.f;
+
         bridges.surfaces = (custom_angle_deg > 0.0 && !relative_angle) ?
             expand_merge_surfaces(this->fill_surfaces.surfaces, stBottomBridge, expansion_zones, closing_radius, custom_angle_rad + align_offset_rad) :
             expand_bridges_detect_orientations(this->fill_surfaces.surfaces, expansion_zones, closing_radius,
-                // ORCA: what the layer below supports, for anchoring bridge edges on it (see detect_bridge_directions).
-                lower_layer_covered != nullptr ? *lower_layer_covered :
-                lower_layer != nullptr ? to_polygons(lower_layer->lslices) : Polygons(),
-                // The radius bottom surfaces are opened by in PrintObject::detect_surfaces_type.
-                this->flow(frExternalPerimeter).scaled_width() / 10.f);
+                                               lower_layer_anchors, lower_layer_tolerance);
         if (custom_angle_deg > 0.0 && relative_angle) {
             for (Surface &bridge_surface : bridges.surfaces) {
                 if (bridge_surface.bridge_angle >= 0)
