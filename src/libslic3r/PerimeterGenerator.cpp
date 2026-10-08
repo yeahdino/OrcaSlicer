@@ -1449,14 +1449,15 @@ static void defer_unsupported_loops(const PerimeterGenerator &perimeter_generato
 // When a layer bridges an opening and the solid area on one side is too narrow for all of the walls, the walls that do
 // not fit would otherwise run along the opening in mid air. Instead, the first wall that would hang over the bridge and
 // every wall after it are laid out around the solid area with the bridge cut out of their region, set back so the
-// bridge reaches onto solid ground before meeting them. Walls that cross the opening as a span from one solid edge to
-// another are left as they are.
+// bridge reaches onto solid ground before meeting them. Walls that cross the opening as a span, from one solid edge to
+// another or straight across it the short way, are left as they are.
 struct WallBridge
 {
     // The part of the wall region over air that is wider than about three walls.
     ExPolygons              area;
     // The solid edges along it - solid ground of the layer below beside it - one entry per separate edge, grown a
-    // little so points on the bridge boundary fall inside them. A wall may cross the bridge only from one to another.
+    // little so points on the bridge boundary fall inside them. See wall_hangs_over_bridge() for the walls that may
+    // cross the bridge.
     std::vector<ExPolygons> anchors;
 
     bool empty() const { return area.empty(); }
@@ -1494,8 +1495,9 @@ static ExPolygons bridge_with_anchor(const WallBridge &bridge, double nozzle_dia
     return offset_ex(bridge.area, std::min(float(scale_(BRIDGE_INFILL_MARGIN)), float(scale_(nozzle_diameter * BRIDGE_INFILL_MARGIN / 0.4))));
 }
 
-// True if one of these walls would hang over the bridge: some stretch of it over the bridge does not run across it from
-// one solid edge to a different one, but runs along it, comes back to the edge it started from or ends in the air.
+// True if one of these walls would hang over the bridge: some stretch of it over the bridge ends in the air, or runs
+// along the opening rather than across it: it comes back to the edge it started from, after more than about 1.5 times
+// the width of the opening.
 static bool wall_hangs_over_bridge(const Polygons &loops, const Polylines &open_walls, const WallBridge &bridge, coord_t perimeter_spacing)
 {
     auto over_bridge = [&bridge](const Point &p) {
@@ -1524,14 +1526,21 @@ static bool wall_hangs_over_bridge(const Polygons &loops, const Polylines &open_
             return true; // the whole loop is over the bridge
         paths.emplace_back(loop.split_at_index(int(start)));
     }
-    for (const Polyline &piece : intersection_pl(paths, bridge.area)) {
-        if (piece.length() < double(perimeter_spacing))
-            continue;
-        const int a = anchor_of(piece.first_point());
-        const int b = anchor_of(piece.last_point());
-        if (a < 0 || b < 0 || a == b)
-            return true;
-    }
+    for (const ExPolygon &opening : bridge.area)
+        for (const Polyline &piece : intersection_pl(paths, opening)) {
+            const double length = piece.length();
+            if (length < double(perimeter_spacing))
+                continue;
+            const int a = anchor_of(piece.first_point());
+            const int b = anchor_of(piece.last_point());
+            if (a < 0 || b < 0)
+                return true; // ends in the air
+            // Back on the edge it started from, as across the mouth of a channel closed at the far end, whose sides are
+            // one edge: still a span if the opening is wider than two thirds of the stretch, that is, shrinking it by a
+            // third of the stretch leaves something.
+            if (a == b && offset_ex(opening, -float(length / 3.)).empty())
+                return true;
+        }
     return false;
 }
 
